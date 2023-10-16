@@ -4,22 +4,16 @@ import os
 import torch
 from datasets import load_dataset
 from transformers import LlamaTokenizer
-
-import torch
-from transformers import LlamaTokenizer
+from transformers import AutoModel, AutoModelForCausalLM
 
 import colossalai
 from colossalai.inference.tensor_parallel.engine import TPInferEngine
+from colossalai.inference.quant.smoothquant.models.llama import SmoothLlamaForCausalLM
 
-# from colossalai.inference.tensor_parallel.modeling._utils import init_to_get_rotary
 from colossalai.logging import disable_existing_loggers
-from colossalai.shardformer import ShardConfig
-
 from colossalai.shardformer import ShardConfig
 from colossalai.testing import clear_cache_before_run, rerun_if_address_is_in_use, spawn
 
-from colossalai.inference.quant.smoothquant.models.llama import SmoothLlamaForCausalLM
-from transformers import AutoModel, AutoModelForCausalLM
 import time
 
 
