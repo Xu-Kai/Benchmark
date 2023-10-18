@@ -1,20 +1,61 @@
+import torch
+from torch import distributed as dist
+import time
+from tqdm import tqdm
+import numpy as np
+
+
 import argparse
 import os
 
 import torch
-from datasets import load_dataset
 from transformers import LlamaTokenizer
-from transformers import AutoModel, AutoModelForCausalLM
+
+import torch
+from transformers import LlamaTokenizer
 
 import colossalai
 from colossalai.inference.tensor_parallel.engine import TPInferEngine
-from colossalai.inference.quant.smoothquant.models.llama import SmoothLlamaForCausalLM
 
+# from colossalai.inference.tensor_parallel.modeling._utils import init_to_get_rotary
 from colossalai.logging import disable_existing_loggers
+from colossalai.shardformer import ShardConfig
+
 from colossalai.shardformer import ShardConfig
 from colossalai.testing import clear_cache_before_run, rerun_if_address_is_in_use, spawn
 
+from colossalai.inference.quant.smoothquant.models.llama import SmoothLlamaForCausalLM
+from transformers import AutoModel, AutoModelForCausalLM
 import time
+
+from copy import deepcopy
+
+
+def print_prefill_perf_stats(latency_set, config, max_mem_allocated, batch_size, input_len, warmup=3):
+    # trim warmup queries
+    latency_set = list(latency_set)
+    latency_set = latency_set[warmup:]
+    count = len(latency_set)
+
+    if count > 0:
+        latency_set.sort()
+        avg = sum(latency_set) / count
+        num_layers = getattr(config, "num_layers", config.num_hidden_layers)
+        num_parameters = num_layers * config.hidden_size * config.hidden_size * 12
+        num_bytes = 2
+        print("PREFILL STAGE:")
+        print("Batch Size: {}".format(batch_size))
+        print("Input Len: {}".format(input_len))
+        print("Max CUDA memory allocated: {0:8.4f} GB".format(max_mem_allocated / 1024 / 1024 / 1024))
+        print("Avg Prefill Latency: {0:8.2f} ms".format(avg * 1000))
+        print("Avg Prefill BW: {0:8.2f} GB/s".format(1 / avg * num_parameters * num_bytes / 1e9))
+        print(
+            "Avg Prefill flops: {0:8.2f} TFlops/s".format(
+                1 / avg * num_parameters * num_bytes * batch_size * input_len / 1e12
+            )
+        )
+        print("Avg Prefill Throughput: tokens/s: {}".format((1000 / (avg * 1000)) * batch_size * input_len))
+    return avg
 
 
 def print_perf_stats(latency_set, config, max_mem_allocated, batch_size, input_len, out_len, warmup=3):
@@ -30,18 +71,15 @@ def print_perf_stats(latency_set, config, max_mem_allocated, batch_size, input_l
         num_parameters = num_layers * config.hidden_size * config.hidden_size * 12
         num_bytes = 2
 
+        print("DECODE STAGE:")
         print("Batch Size: {}".format(batch_size))
         print("Input Len: {}".format(input_len))
         print("Output Len: {}".format(out_len))
         print("Max CUDA memory allocated: {0:8.4f} GB".format(max_mem_allocated / 1024 / 1024 / 1024))
-        print("Avg Per Token Latency: {0:8.2f} ms".format(avg * 1000))
-        print("Avg BW: {0:8.2f} GB/s".format(1 / avg * num_parameters * num_bytes / 1e9))
-        print(
-            "Avg flops: {0:8.2f} TFlops/s".format(
-                1 / avg * num_parameters * num_bytes * (out_len + input_len) / out_len * batch_size / 1e12
-            )
-        )
-        print("Avg Throughput: tokens/s: {}".format((1000 / (avg * 1000)) * batch_size))
+        print("Avg Decode Per Token Latency: {0:8.2f} ms".format(avg * 1000))
+        print("Avg Decode BW: {0:8.2f} GB/s".format(1 / avg * num_parameters * num_bytes / 1e9))
+        print("Avg Decode flops: {0:8.2f} TFlops/s".format(1 / avg * num_parameters * num_bytes * batch_size / 1e12))
+        print("Avg Decode Throughput: tokens/s: {}".format((1000 / (avg * 1000)) * batch_size))
 
 
 def run_benchmark(model, iters=10, batch_size=1, input_len=16, **generate_kwargs):
@@ -49,6 +87,26 @@ def run_benchmark(model, iters=10, batch_size=1, input_len=16, **generate_kwargs
         "input_ids": torch.randint(1, 1000, (batch_size, input_len), device="cuda"),
         "attention_mask": torch.ones((batch_size, input_len), device="cuda"),
     }
+
+    torch.cuda.empty_cache()
+
+    torch.cuda.reset_peak_memory_stats()
+    times = []
+    pefill_generate_kwargs = deepcopy(generate_kwargs)
+    pefill_generate_kwargs["max_new_tokens"] = 1
+    for i in range(iters):
+        torch.cuda.synchronize()
+        start = time.time()
+        outputs = model.generate(**input_tokens, **pefill_generate_kwargs)
+        torch.cuda.synchronize()
+        end = time.time()
+        out_len = outputs.shape[1]
+        print(f" iter {i}: out len {outputs.shape}, generation time {str(end - start)} s")
+        times.append((end - start) / (out_len - input_len))
+    max_mem_allocated = torch.cuda.max_memory_allocated()
+
+    prefill_avg_latency = print_prefill_perf_stats(times, model.config, max_mem_allocated, batch_size, input_len)
+
     torch.cuda.empty_cache()
 
     torch.cuda.reset_peak_memory_stats()
@@ -62,7 +120,7 @@ def run_benchmark(model, iters=10, batch_size=1, input_len=16, **generate_kwargs
         end = time.time()
         out_len = outputs.shape[1]
         print(f" iter {i}: out len {outputs.shape}, generation time {str(end - start)} s")
-        times.append((end - start) / (out_len - input_len))
+        times.append((end - start - prefill_avg_latency) / (out_len - input_len))
     max_mem_allocated = torch.cuda.max_memory_allocated()
 
     print_perf_stats(times, model.config, max_mem_allocated, batch_size, input_len, out_len)
@@ -73,6 +131,26 @@ def run_tp_benchmark(engine, iters=10, batch_size=1, input_len=16, **generate_kw
         "input_ids": torch.randint(1, 1000, (batch_size, input_len), device="cuda"),
         "attention_mask": torch.ones((batch_size, input_len), device="cuda"),
     }
+
+    torch.cuda.empty_cache()
+
+    torch.cuda.reset_peak_memory_stats()
+    times = []
+    pefill_generate_kwargs = deepcopy(generate_kwargs)
+    pefill_generate_kwargs["max_new_tokens"] = 1
+    for i in range(iters):
+        torch.cuda.synchronize()
+        start = time.time()
+        outputs = engine.generate(input_tokens, **pefill_generate_kwargs)
+        torch.cuda.synchronize()
+        end = time.time()
+        out_len = outputs.shape[1]
+        print(f" iter {i}: out len {outputs.shape}, generation time {str(end - start)} s")
+        times.append((end - start) / (out_len - input_len))
+    max_mem_allocated = torch.cuda.max_memory_allocated()
+
+    prefill_avg_latency = print_prefill_perf_stats(times, engine.model.config, max_mem_allocated, batch_size, input_len)
+
     torch.cuda.empty_cache()
 
     torch.cuda.reset_peak_memory_stats()
@@ -86,7 +164,7 @@ def run_tp_benchmark(engine, iters=10, batch_size=1, input_len=16, **generate_kw
         end = time.time()
         out_len = outputs.shape[1]
         print(f" iter {i}: out len {outputs.shape}, generation time {str(end - start)} s")
-        times.append((end - start) / (out_len - input_len))
+        times.append((end - start - prefill_avg_latency) / (out_len - input_len))
     max_mem_allocated = torch.cuda.max_memory_allocated()
 
     print_perf_stats(times, engine.model.config, max_mem_allocated, batch_size, input_len, out_len)
@@ -101,7 +179,7 @@ def run_vllm_benchmark(model, iters=10, batch_size=1, input_len=16, max_out_len=
         top_p=1.0,
         use_beam_search=False,
         ignore_eos=True,
-        max_tokens=max_out_len,
+        max_tokens=1,
     )
 
     dummy_prompt_token_ids = []
@@ -128,6 +206,34 @@ def run_vllm_benchmark(model, iters=10, batch_size=1, input_len=16, max_out_len=
         out_len = outputs.shape[1]
         print(f" iter {i}: out len {outputs.shape}, generation time {str(end - start)} s")
         times.append((end - start) / (out_len - input_len))
+    max_mem_allocated = torch.cuda.max_memory_allocated()
+    prefill_avg_latency = print_prefill_perf_stats(times, model.config, max_mem_allocated, batch_size, input_len)
+
+    sampling_params = SamplingParams(
+        n=1,
+        temperature=1.0,
+        top_p=1.0,
+        use_beam_search=False,
+        ignore_eos=True,
+        max_tokens=max_out_len,
+    )
+
+    torch.cuda.empty_cache()
+
+    torch.cuda.reset_peak_memory_stats()
+    times = []
+
+    for i in range(iters):
+        torch.cuda.synchronize()
+        start = time.time()
+        outputs = model.generate(
+            prompt_token_ids=dummy_prompt_token_ids, sampling_params=sampling_params, use_tqdm=False
+        )
+        torch.cuda.synchronize()
+        end = time.time()
+        out_len = outputs.shape[1]
+        print(f" iter {i}: out len {outputs.shape}, generation time {str(end - start)} s")
+        times.append((end - start - prefill_avg_latency) / (out_len - input_len))
     max_mem_allocated = torch.cuda.max_memory_allocated()
 
     print_perf_stats(times, model.config, max_mem_allocated, batch_size, input_len, out_len)
@@ -177,7 +283,7 @@ def build_cai_gptq_model_and_tokenizer(model_name, quantized_model_dir, max_batc
 
 
 def build_cai_model_and_tokenizer(model_name, max_batch_size, max_input_len, max_output_len):
-    tokenizer = LlamaTokenizer.from_pretrained(model_name)
+    tokenizer = LlamaTokenizer.from_pretrained(model_name, padding_side="left")
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # load quantized model to the first GPU
@@ -185,7 +291,7 @@ def build_cai_model_and_tokenizer(model_name, max_batch_size, max_input_len, max
         model_name,
     )
     model = model.half()
-
+    print("this is in cai model")
     shard_config = ShardConfig(enable_tensor_parallelism=False, inference_only=True)
     infer_engine = TPInferEngine(model, shard_config, max_batch_size, max_input_len, max_output_len)
     infer_engine.model = infer_engine.model.cuda()
@@ -273,8 +379,8 @@ def bench_llama(args):
             run_vllm_benchmark(model, iters=10, batch_size=batch_size, input_len=1024, max_out_len=128)
 
     if args.bench_type in ["cai-gptq", "cai"]:
-        generate_kwargs = dict(max_new_tokens=16, do_sample=False, use_cache=True)
-        input_tokens = tokenizer(["auto-gptq is "], return_tensors="pt").to("cuda")
+        generate_kwargs = dict(max_new_tokens=32, do_sample=False, use_cache=True)
+        input_tokens = tokenizer(["auto-gptq is ", "This is better for "], return_tensors="pt", padding=True).to("cuda")
         out = model.generate(input_tokens, **generate_kwargs)
         text = tokenizer.batch_decode(out)
         print("out is:", text)
