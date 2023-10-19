@@ -1,20 +1,13 @@
+import time
 import argparse
-import os
-
 import torch
-from datasets import load_dataset
-from transformers import LlamaTokenizer
-from transformers import AutoModel, AutoModelForCausalLM
+from transformers import LlamaTokenizer, AutoModelForCausalLM
 
 import colossalai
 from colossalai.inference.tensor_parallel.engine import TPInferEngine
-from colossalai.inference.quant.smoothquant.models.llama import SmoothLlamaForCausalLM
-
 from colossalai.logging import disable_existing_loggers
 from colossalai.shardformer import ShardConfig
 from colossalai.testing import clear_cache_before_run, rerun_if_address_is_in_use, spawn
-
-import time
 
 
 def print_perf_stats(latency_set, config, max_mem_allocated, batch_size, input_len, out_len, warmup=3):
@@ -104,8 +97,9 @@ def run_vllm_benchmark(model, iters=10, batch_size=1, input_len=16, max_out_len=
         max_tokens=max_out_len,
     )
 
+    # dummy_prompt_token_ids = [[0] * input_len] * batch_size
+    # dummy_prompt_token_ids = torch.randint(1, 10240, (batch_size, input_len)).tolist()
     dummy_prompt_token_ids = []
-    dummy_prompt_token_ids_s = torch.randint(1, 10240, (batch_size, input_len))
     for t in range(batch_size):
         a = []
         for i in range(input_len):
@@ -125,12 +119,14 @@ def run_vllm_benchmark(model, iters=10, batch_size=1, input_len=16, max_out_len=
         )
         torch.cuda.synchronize()
         end = time.time()
-        out_len = outputs.shape[1]
-        print(f" iter {i}: out len {outputs.shape}, generation time {str(end - start)} s")
-        times.append((end - start) / (out_len - input_len))
+        out_len = len(outputs[0].outputs[0].token_ids)
+        print(f" iter {i}: out len {out_len}, generation time {str(end - start)} s")
+        times.append((end - start) / out_len)
     max_mem_allocated = torch.cuda.max_memory_allocated()
 
-    print_perf_stats(times, model.config, max_mem_allocated, batch_size, input_len, out_len)
+    print_perf_stats(
+        times, model.llm_engine.model_config.hf_config, max_mem_allocated, batch_size, input_len, out_len + input_len
+    )
 
 
 def build_auto_gptq_model_and_tokenizer(model_name, gptq_quantized_model_dir):
@@ -170,7 +166,7 @@ def build_cai_gptq_model_and_tokenizer(model_name, quantized_model_dir, max_batc
 
     model_config = model.config
     shard_config = ShardConfig(enable_tensor_parallelism=False, inference_only=True, inference_gptq=True)
-    infer_engine = TPInferEngine(model.model, shard_config, max_batch_size, max_input_len, max_output_len)
+    infer_engine = TPInferEngine(model, shard_config, max_batch_size, max_input_len, max_output_len)
     infer_engine.model = infer_engine.model.cuda()
 
     return infer_engine, tokenizer
@@ -215,6 +211,8 @@ def build_vllm_model_and_tokenizer(model_name):
 
 
 def build_cai_smooth_model_and_tokenizer(model_name, quantized_model_dir):
+    from colossalai.inference.quant.smoothquant.models.llama import SmoothLlamaForCausalLM
+
     tokenizer = LlamaTokenizer.from_pretrained(model_name)
     tokenizer.pad_token_id = tokenizer.eos_token_id
     model = SmoothLlamaForCausalLM.from_quantized(quantized_model_dir, model_basename="llama-7b")
@@ -245,7 +243,7 @@ def bench_llama(args):
     if args.bench_type == "auto-gptq":
         model, tokenizer = build_auto_gptq_model_and_tokenizer(model_path, quantized_path)
     elif args.bench_type == "smoothquant":
-        model = SmoothLlamaForCausalLM.from_quantized(quantized_path, model_basename="llama-7b")
+        model, tokenizer = build_cai_smooth_model_and_tokenizer(model_path, quantized_path)
     elif args.bench_type == "huggingface":
         model, tokenizer = build_hg_model_and_tokenizer(model_path)
     elif args.bench_type == "vllm":
